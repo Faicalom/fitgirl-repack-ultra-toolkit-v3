@@ -10,10 +10,14 @@ import random
 import re
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 from urllib.parse import unquote
 
 from playwright.async_api import async_playwright
+
+BASE_DIR = Path(__file__).resolve().parent
+os.chdir(BASE_DIR)
 
 # ================== SETTINGS ==================
 HEADLESS = True
@@ -29,6 +33,71 @@ JS_SETTLE_DELAY = 0.8
 
 LINKS_FILE = "fuckingfast_links.txt"
 LOG_FILE   = "failed_links.txt"
+
+BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/125.0.0.0 Safari/537.36"
+)
+
+BROWSER_HEADERS = {
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://fuckingfast.co/",
+    "Upgrade-Insecure-Requests": "1",
+}
+
+
+def detect_system_browser_channel() -> Optional[str]:
+    channel_paths = [
+        ("msedge", [
+            Path(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"),
+            Path(r"C:\Program Files\Microsoft\Edge\Application\msedge.exe"),
+            Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft" / "Edge" / "Application" / "msedge.exe",
+        ]),
+        ("chrome", [
+            Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
+            Path(r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"),
+            Path(os.environ.get("LOCALAPPDATA", "")) / "Google" / "Chrome" / "Application" / "chrome.exe",
+        ]),
+    ]
+    for channel, paths in channel_paths:
+        if any(path.exists() for path in paths if str(path)):
+            return channel
+    return None
+
+
+async def launch_compatible_browser(playwright):
+    executable_path = Path(playwright.chromium.executable_path)
+    if executable_path.exists():
+        try:
+            return await playwright.chromium.launch(
+                executable_path=str(executable_path),
+                headless=HEADLESS,
+            )
+        except Exception as exc:
+            log(f"[WARN] Playwright full Chromium failed ({type(exc).__name__})")
+
+    try:
+        return await playwright.chromium.launch(headless=HEADLESS)
+    except Exception as exc:
+        channel = detect_system_browser_channel()
+        if not channel:
+            raise
+        log(f"[WARN] Playwright Chromium failed ({type(exc).__name__}); using installed {channel}")
+        return await playwright.chromium.launch(channel=channel, headless=HEADLESS)
+
+
+async def new_browser_context(browser):
+    context = await browser.new_context(
+        accept_downloads=False,
+        user_agent=BROWSER_USER_AGENT,
+        extra_http_headers=BROWSER_HEADERS,
+        locale="en-US",
+        viewport={"width": 1366, "height": 768},
+    )
+    await context.route("**/*", block_resources)
+    return context
 
 # ================== REGEX PATTERNS ==================
 _FF_DL = r"https?://(?:dl\.)?fuckingfast\.co/dl/"
@@ -105,7 +174,7 @@ async def flush_resolved(links: list) -> None:
 
 
 async def process_single_link(
-    context,
+    browser,
     link: str,
     index: int,
     filename: str,
@@ -130,10 +199,11 @@ async def process_single_link(
                     captured_for_current.append(url)
                     request_event.set()
 
+            context = None
             page = None
             try:
+                context = await new_browser_context(browser)
                 page = await context.new_page()
-                await page.route("**/*", block_resources)
                 page.on("request", capture_direct_link)
 
                 await page.goto(
@@ -177,15 +247,15 @@ async def process_single_link(
                     await flush_resolved(links)
                     log(f"[{index}/{total}] OK")
                     await asyncio.sleep(random.uniform(1.8, 4.2))
-                    await page.close()
+                    await context.close()
                     return True
 
                 log(f"[{index}/{total}] [WARN] Attempt {attempt} failed — no direct link found")
-                await page.close()
+                await context.close()
 
             except Exception as exc:
-                if page:
-                    await page.close()
+                if context:
+                    await context.close()
                 if attempt == MAX_RETRIES:
                     if fail_list is not None:
                         fail_list.append((index, link, filename))
@@ -220,14 +290,12 @@ async def main() -> None:
     log(f"[INFO] Loaded {len(links)} link(s)")
 
     async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(headless=HEADLESS)
-        context = await browser.new_context(accept_downloads=False)
-        await context.route("**/*", block_resources)
+        browser = await launch_compatible_browser(playwright)
 
         semaphore = asyncio.Semaphore(CONCURRENCY)
         tasks = [
             process_single_link(
-                context,
+                browser,
                 link,
                 idx,
                 extract_filename_from_url(link, idx),
@@ -245,7 +313,7 @@ async def main() -> None:
             safe_semaphore = asyncio.Semaphore(CONCURRENCY_SAFE)
             retry_tasks = [
                 process_single_link(
-                    context,
+                    browser,
                     link,
                     idx,
                     filename,
